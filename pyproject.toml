@@ -1,0 +1,24 @@
+[project]
+name = "2110531-dsde-2026s1-final-exam-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Farsky", email = "thun.kerd123@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "numpy>=2.5.4",
+    "osmnx>=2.1.1",
+    "pandas>=3.1.1",
+    "requests>=2.34.2",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+2110531-dsde-2026s1-final-exam-project = "2110531_dsde_2026s1_final_exam_project:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
