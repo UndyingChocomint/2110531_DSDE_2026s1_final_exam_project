@@ -1,4 +1,8 @@
-"""CCTV dataset enrichment. Functions can be imported without running the pipeline."""
+"""CCTV enrichment with location-aware, next-hour Longdo-reported crash labels.
+
+A label of 0 means no nearby reported event was matched in the supplied
+Longdo records; it does not guarantee that no actual crash occurred.
+"""
 from pathlib import Path
 from config import DATA_DIR, SRC_DIR
 from urllib.parse import urljoin
@@ -15,6 +19,11 @@ from shapely.geometry import Point
 
 RAW = DATA_DIR / 'raw'
 CAMERA_COL = 'camera_id'
+
+# 1. Crash-label configuration
+PREDICTION_MINUTES = 60      # Will a crash occur within the NEXT hour?
+NEARBY_RADIUS_METERS = 500  # ...within 500 m of the camera?
+LABEL_METHOD = 'future_nearby_incident'
 
 
 def load_cctv(raw_dir=RAW):
@@ -40,7 +49,7 @@ def load_cctv(raw_dir=RAW):
 
 
 def get_longdo_data(start, end, raw_dir=RAW):
-    """Return hourly traffic index and incident counts for the CCTV date range."""
+    """Return hourly traffic index and individual incident records."""
     raw_dir = Path(raw_dir)
     page = requests.get('https://traffic.longdo.com/download', timeout=30)
     page.raise_for_status()
@@ -78,41 +87,96 @@ def get_longdo_data(start, end, raw_dir=RAW):
                    .rename(columns={'index': 'traffic_index'}))
         traffic = traffic[traffic['hour'].between(start, end + pd.Timedelta(days=1))]
 
-    if not accidents.empty:
-        # Longdo incident files don't necessarily have a 'timestamp' column.
-        # Use their actual event-start column rather than the CCTV filename date.
-        date_column = next(
-            (col for col in ('timestamp', 'start', 'start_time', 'datetime',
-                             'date_time', 'startdate', 'start_date', 'starttime',
-                             'event_start', 'date', 'created_at', 'time')
-             if col in accidents.columns), None
-        )
-        if date_column is None:
-            raise ValueError(
-                f"Longdo incident date column not found. "
-                f"Available columns: {accidents.columns.tolist()}"
-            )
+    if accidents.empty:
+        raise ValueError('No Longdo accident records downloaded; cannot label CCTV images.')
 
-        # Some incident exports separate the date and time into two columns.
-        values = accidents[date_column].astype(str)
-        if date_column == 'date' and 'time' in accidents.columns:
-            values = values + ' ' + accidents['time'].astype(str)
-        if date_column == 'time' and not values.str.contains(r'[-/ ]|\d{8}', regex=True).any():
-            raise ValueError('Longdo incidents have a time column but no usable date column.')
-        accidents['timestamp'] = pd.to_datetime(values, errors='coerce')
-        if accidents['timestamp'].notna().sum() == 0:
-            raise ValueError(f'Could not parse Longdo incident dates from column {date_column!r}.')
-        accidents['hour'] = accidents['timestamp'].dt.floor('h')
-        accidents = (
-            accidents.dropna(subset=['hour'])
-            .groupby('hour').size()
-            .rename('accident_count').reset_index()
-        )
-        accidents = accidents[
-            accidents['hour'].between(start, end + pd.Timedelta(days=1))
-        ]
+    # Keep individual events: hourly citywide counts are NOT camera-specific labels.
+    date_column = next(
+        (col for col in ('timestamp', 'start', 'start_time', 'datetime',
+                         'date_time', 'startdate', 'start_date', 'starttime',
+                         'event_start', 'date', 'created_at', 'time')
+         if col in accidents.columns), None
+    )
+    if date_column is None:
+        raise ValueError(f'Longdo incident timestamp missing: {accidents.columns.tolist()}')
+    values = accidents[date_column].astype(str)
+    if date_column == 'date' and 'time' in accidents.columns:
+        values = values + ' ' + accidents['time'].astype(str)
+    accidents['event_time'] = pd.to_datetime(values, errors='coerce')
 
+    # Locations MUST be incident locations, never camera coordinates or city centroids.
+    lat_col = next((col for col in ('latitude', 'lat', 'location_latitude')
+                    if col in accidents.columns), None)
+    lon_col = next((col for col in ('longitude', 'lon', 'lng', 'long',
+                                    'location_longitude')
+                    if col in accidents.columns), None)
+    if lat_col is None or lon_col is None:
+        raise ValueError(
+            'Longdo accident CSV lacks numeric latitude/longitude columns. '
+            'Cannot construct camera-specific crash labels. '
+            f'Available columns: {accidents.columns.tolist()}'
+        )
+    accidents['latitude'] = pd.to_numeric(accidents[lat_col], errors='coerce')
+    accidents['longitude'] = pd.to_numeric(accidents[lon_col], errors='coerce')
+    valid = (accidents['event_time'].notna()
+             & accidents['latitude'].between(-90, 90)
+             & accidents['longitude'].between(-180, 180))
+    if not valid.all():
+        raise ValueError(
+            f'{(~valid).sum()} Longdo incidents have missing/invalid times or coordinates. '
+            'Fix or verify source records before generating negative labels.'
+        )
+    accidents = accidents[['event_time', 'latitude', 'longitude']].copy()
     return traffic, accidents
+
+
+# 2. Create labels using nearby FUTURE events, not citywide hourly counts
+
+def add_future_crash_labels(cctv, accidents):
+    """Label 1 if a verified incident happens within radius in (t, t+horizon]."""
+    horizon = pd.Timedelta(minutes=PREDICTION_MINUTES)
+    if horizon <= pd.Timedelta(0) or NEARBY_RADIUS_METERS <= 0:
+        raise ValueError('Prediction horizon and nearby radius must be positive.')
+
+    df = cctv.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+    df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+    if (df['timestamp'].isna().any() or not df['latitude'].between(-90, 90).all()
+            or not df['longitude'].between(-180, 180).all()):
+        raise ValueError('CCTV images require valid timestamps and coordinates for labeling.')
+    # An unmatched image receives 0 (no Longdo-reported crash nearby).
+    # Ensure the source includes the full prediction horizon when interpreting
+    # zeros near the end of its available reporting period.
+
+    import numpy as np
+    # Haversine distances for each unique camera; events are checked once/camera.
+    def distance_m(lat1, lon1, lat2, lon2):
+        lat1, lon1 = np.radians([lat1, lon1])
+        lat2, lon2 = np.radians(lat2), np.radians(lon2)
+        dlat, dlon = lat2 - lat1, lon2 - lon1
+        a = np.sin(dlat / 2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon / 2)**2
+        return 6371000 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+    df['crash_next_hour'] = 0
+    event_lat = accidents['latitude'].to_numpy(dtype=float)
+    event_lon = accidents['longitude'].to_numpy(dtype=float)
+    for camera_id, group in df.groupby(CAMERA_COL):
+        lat, lon = group[['latitude', 'longitude']].iloc[0]
+        nearby = distance_m(lat, lon, event_lat, event_lon) <= NEARBY_RADIUS_METERS
+        times = np.sort(accidents.loc[nearby, 'event_time'].to_numpy(dtype='datetime64[ns]'))
+        if not len(times):
+            continue
+        captures = group['timestamp'].to_numpy(dtype='datetime64[ns]')
+        # Strictly after capture; up to and including the horizon endpoint.
+        start_pos = np.searchsorted(times, captures, side='right')
+        end_pos = np.searchsorted(times, captures + horizon.to_timedelta64(), side='right')
+        df.loc[group.index, 'crash_next_hour'] = (end_pos > start_pos).astype('int8')
+    df['label_method'] = LABEL_METHOD
+    df['label_window_minutes'] = PREDICTION_MINUTES
+    df['label_radius_m'] = NEARBY_RADIUS_METERS
+    print('Future nearby Longdo-reported crash labels:', df['crash_next_hour'].value_counts().to_dict())
+    return df
 
 
 def get_weather(start, end, latitude, longitude):
@@ -139,16 +203,8 @@ def get_roads(cctv_df, on_group=None):
     cameras['longitude'] = pd.to_numeric(cameras['longitude'], errors='coerce')
     cameras = cameras.dropna(subset=['latitude', 'longitude'])
 
-    # # Group cameras into ~3 km cells; ERA5 grouping remains unchanged.
-    # # Floor-based cells keep coordinates 100.51 and 100.52 together.
-    # cameras['osm_lat'] = ((cameras['latitude'] / 0.03).round() * 0.03).round(2)
-    # cameras['osm_lon'] = ((cameras['longitude'] / 0.03).round() * 0.03).round(2)
-    
-    # Group cameras into approximately 1 km cells
-    cameras['osm_lat'] = cameras['latitude'].round(2)
-    cameras['osm_lon'] = cameras['longitude'].round(2)
-    print('OSM areas:', cameras[['osm_lat', 'osm_lon']].drop_duplicates().shape[0],
-          'for', len(cameras), 'cameras')
+    # Local Overpass: query exact camera coordinates, without rounding/grouping.
+    print(f'OSM queries: {len(cameras)} exact camera locations')
 
     # OSMnx saves successful Overpass downloads for future script runs.
     ox.settings.use_cache = True
@@ -166,29 +222,20 @@ def get_roads(cctv_df, on_group=None):
         ).iloc[0]
 
     rows = []
-    groups = cameras.groupby(['osm_lat', 'osm_lon'])
-    total_groups = groups.ngroups
+    total_groups = len(cameras)
     total_start = time.perf_counter()
-    for group_index, ((lat, lon), group) in enumerate(groups):
+    for group_index, camera in enumerate(cameras.itertuples(index=False)):
         area_start = time.perf_counter()
         progress = f'{group_index + 1}/{total_groups}'
-        print(f'{progress}: Processing OSM area ({lat:.2f}, {lon:.2f})', flush=True)
-        # Center the query on the cameras, not the rounded grid coordinate.
-        center_lat = group['latitude'].mean()
-        center_lon = group['longitude'].mean()
-        lat_m = (group['latitude'] - center_lat) * 111_000
-        lon_m = ((group['longitude'] - center_lon) * 111_000
-                 * math.cos(math.radians(center_lat)))
-        radius = math.ceil((lat_m**2 + lon_m**2).pow(0.5).max() + 500)
-
-        # Space out new area requests even when the previous area failed.
-        if group_index:
-            time.sleep(5)
+        lat, lon = camera.latitude, camera.longitude
+        print(f'{progress}: Processing camera {camera.camera_id} ({lat:.6f}, {lon:.6f})', flush=True)
+        center_lat, center_lon = lat, lon
+        radius = 500  # Exact camera location, 500 m surrounding road network.
 
         graph = None
         for attempt in range(3):
             try:
-                # One shared road-network download covering the entire group.
+                # Query the road network around this exact camera location.
                 graph = ox.graph_from_point(
                     (center_lat, center_lon), dist=radius, network_type='drive'
                 )
@@ -207,21 +254,20 @@ def get_roads(cctv_df, on_group=None):
             _, edges = ox.graph_to_gdfs(graph)
             edges = edges.to_crs('EPSG:3857')
 
-            for camera in group.itertuples(index=False):
-                point = gpd.GeoSeries(
-                    [Point(camera.longitude, camera.latitude)], crs='EPSG:4326'
-                ).to_crs(edges.crs).iloc[0]
-                road = edges.loc[edges.distance(point).idxmin()]
-                bridge = first(road.get('bridge'))
-                rows.append({
-                    'camera_id': camera.camera_id,
-                    'road_type': first(road.get('highway')),
-                    'lane_count': number(road.get('lanes')),
-                    'speed_limit_raw': first(road.get('maxspeed')),
-                    'oneway_feature': road.get('oneway'),
-                    'bridge_feature': int(pd.notna(bridge) and
-                                          str(bridge).lower() not in ('no', 'false'))
-                })
+            point = gpd.GeoSeries(
+                [Point(camera.longitude, camera.latitude)], crs='EPSG:4326'
+            ).to_crs(edges.crs).iloc[0]
+            road = edges.loc[edges.distance(point).idxmin()]
+            bridge = first(road.get('bridge'))
+            rows.append({
+                'camera_id': camera.camera_id,
+                'road_type': first(road.get('highway')),
+                'lane_count': number(road.get('lanes')),
+                'speed_limit_raw': first(road.get('maxspeed')),
+                'oneway_feature': road.get('oneway'),
+                'bridge_feature': int(pd.notna(bridge) and
+                                      str(bridge).lower() not in ('no', 'false'))
+            })
         except Exception as exc:
             print(f'{progress}: Road matching failed after {time.perf_counter() - area_start:.2f}s: {exc}', flush=True)
 
@@ -230,7 +276,7 @@ def get_roads(cctv_df, on_group=None):
         if new_rows and on_group is not None:
             on_group(pd.DataFrame(new_rows))
         print(f'{progress}: Finished in {time.perf_counter() - area_start:.2f}s | '
-              f'{len(new_rows)}/{len(group)} cameras', flush=True)
+              f'{len(new_rows)}/1 cameras', flush=True)
 
     print(f'OSM processing complete in {time.perf_counter() - total_start:.2f}s', flush=True)
 
@@ -245,7 +291,7 @@ def build_dataset(raw_dir=RAW, csv_path=None):
     road_cols = ['road_type', 'lane_count', 'speed_limit_raw',
                  'oneway_feature', 'bridge_feature']
 
-    output = Path(csv_path) if csv_path is not None else DATA_DIR / 'processed/cctv_processed.csv'
+    output = Path(csv_path) if csv_path is not None else DATA_DIR / 'interim' / 'cctv_interim.csv'
 
     def save_checkpoint():
         # Write to a temporary file first, so an interrupted write cannot corrupt the CSV.
@@ -270,6 +316,11 @@ def build_dataset(raw_dir=RAW, csv_path=None):
         df = pd.read_csv(csv_path, dtype={'camera_id': str})
         df.columns = df.columns.str.strip().str.lower()
         df['camera_id'] = df['camera_id'].astype(str)
+        if 'crash_next_hour' not in df.columns:
+            raise ValueError(
+                'This CSV has old citywide accident labels. Rebuild from raw CCTV and '
+                'verified Longdo incidents using build_dataset() without csv_path.'
+            )
 
         # Missing road_type identifies cameras whose road matching was skipped.
         if 'road_type' not in df.columns:
@@ -290,8 +341,7 @@ def build_dataset(raw_dir=RAW, csv_path=None):
     traffic, accidents = get_longdo_data(start, end, raw_dir)
     if not traffic.empty:
         df = df.merge(traffic, on='hour', how='left', validate='many_to_one')
-    if not accidents.empty:
-        df = df.merge(accidents, on='hour', how='left', validate='many_to_one')
+    df = add_future_crash_labels(df, accidents)
 
     # Share one weather request among cameras with similar coordinates.
     cameras = df[['camera_id', 'latitude', 'longitude']].drop_duplicates('camera_id').copy()
@@ -331,5 +381,4 @@ def build_dataset(raw_dir=RAW, csv_path=None):
 
 if __name__ == '__main__':
     df = build_dataset()
-    output = DATA_DIR / 'processed/cctv_processed.csv'
-    print('Saved:', output, '| shape:', df.shape)
+    print('Saved:', DATA_DIR / 'interim' / 'cctv_interim.csv', '| shape:', df.shape)
